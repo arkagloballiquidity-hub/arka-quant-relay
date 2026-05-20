@@ -50,8 +50,13 @@ async function fetchYahoo(ticker,range='1y',interval='1d') {
 }
 
 // ─── HEALTH ──────────────────────────────────────────────────────────────────
-app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'2.0',
-  endpoints:['/yahoo','/api/fractal','/api/anomaly','/api/forecast','/api/risk','/api/portfolio','/api/snapshot']}));
+// ─── IN-MEMORY CACHE ─────────────────────────────────────────────────────────
+const _cache = new Map();
+function getCached(k){ const e=_cache.get(k); if(!e||Date.now()>e.exp){_cache.delete(k);return null;} return e.data; }
+function setCached(k,d,ttl=300_000){ _cache.set(k,{data:d,exp:Date.now()+ttl}); }
+
+app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'3.0',
+  endpoints:['/yahoo','/api/fractal','/api/anomaly','/api/forecast','/api/risk','/api/portfolio','/api/snapshot','/api/technicals']}));
 
 // ─── LEGACY Yahoo proxy ───────────────────────────────────────────────────────
 app.get('/yahoo',async(req,res)=>{
@@ -249,6 +254,108 @@ app.get('/api/snapshot',requireAuth,async(req,res)=>{
       position:{size_lots:+(riskUSD/(sl*10)).toFixed(2),size_units:Math.round(riskUSD/sl),
                 risk_usd:+riskUSD.toFixed(2),profit_usd:+(riskUSD*rrV).toFixed(2),effective_risk_pct:+effPct.toFixed(3)}});
   }catch(e){res.status(500).json({error:e.message});}
+});
+
+// ─── /api/technicals — Alpha Vantage RSI + MACD + BBands ─────────────────────
+// Fetches three AV indicators sequentially (rate-limit safe), cached 90 min.
+// Free tier quota: 25 req/day → cache aggressively.
+async function fetchAV(fn, symbol, extra={}) {
+  const key = process.env.ALPHA_VANTAGE_KEY;
+  if (!key) throw new Error('ALPHA_VANTAGE_KEY not configured');
+  const params = new URLSearchParams({ function: fn, symbol, apikey: key, datatype: 'json', ...extra });
+  const r = await fetch(`https://www.alphavantage.co/query?${params}`,
+    { headers: { 'User-Agent': 'ARKAQuantRelay/3.0' } });
+  if (!r.ok) throw new Error(`AV HTTP ${r.status}`);
+  const d = await r.json();
+  if (d['Note'] || d['Information']) throw new Error('AV rate limit reached');
+  return d;
+}
+
+// Extract latest N points from AV time series (RSI, MACD, BBands share the same structure)
+function avSeries(obj, keys, n=60) {
+  return Object.entries(obj)
+    .sort((a,b)=>new Date(a[0])-new Date(b[0]))
+    .slice(-n)
+    .map(([date, vals]) => ({ date, ...Object.fromEntries(keys.map(k=>[k,parseFloat(vals[k])])) }));
+}
+
+app.get('/api/technicals', requireAuth, async (req, res) => {
+  const { ticker, interval='daily' } = req.query;
+  if (!ticker) return res.status(400).json({ error:'ticker required' });
+  const ck = `tech_${ticker.toUpperCase()}_${interval}`;
+  const cached = getCached(ck);
+  if (cached) return res.json(cached);
+  try {
+    const sym = ticker.toUpperCase();
+
+    // ── RSI(14) ──────────────────────────────────────────────
+    const rsiRaw = await fetchAV('RSI', sym, { interval, time_period:'14', series_type:'close' });
+    await new Promise(r=>setTimeout(r, 700));
+
+    // ── MACD(12,26,9) ─────────────────────────────────────────
+    const macdRaw = await fetchAV('MACD', sym, { interval, series_type:'close', fastperiod:'12', slowperiod:'26', signalperiod:'9' });
+    await new Promise(r=>setTimeout(r, 700));
+
+    // ── BBands(20,2) ──────────────────────────────────────────
+    const bbRaw = await fetchAV('BBANDS', sym, { interval, time_period:'20', series_type:'close', nbdevup:'2', nbdevdn:'2' });
+
+    // ── Process RSI ───────────────────────────────────────────
+    const rsiData = rsiRaw['Technical Analysis: RSI'] || {};
+    const rsiSeries = avSeries(rsiData, ['RSI']);
+    const rsiLatest = rsiSeries[rsiSeries.length-1]?.RSI ?? null;
+    const rsiSignal = rsiLatest == null ? 'N/A' : rsiLatest >= 70 ? 'OVERBOUGHT' : rsiLatest <= 30 ? 'OVERSOLD' : 'NEUTRAL';
+
+    // ── Process MACD ──────────────────────────────────────────
+    const macdData = macdRaw['Technical Analysis: MACD'] || {};
+    const macdSeries = avSeries(macdData, ['MACD','MACD_Signal','MACD_Hist']);
+    const macdLast = macdSeries[macdSeries.length-1] || {};
+    const macdTrend = (macdLast.MACD_Hist ?? 0) >= 0 ? 'BULLISH' : 'BEARISH';
+    const macdCross = (() => {
+      if (macdSeries.length < 2) return 'N/A';
+      const prev = macdSeries[macdSeries.length-2];
+      if (prev.MACD_Hist < 0 && macdLast.MACD_Hist >= 0) return 'BULLISH_CROSS';
+      if (prev.MACD_Hist >= 0 && macdLast.MACD_Hist < 0) return 'BEARISH_CROSS';
+      return 'N/A';
+    })();
+
+    // ── Process BBands ────────────────────────────────────────
+    const bbData = bbRaw['Technical Analysis: BBANDS'] || {};
+    const bbSeries = avSeries(bbData, ['Real Upper Band','Real Middle Band','Real Lower Band']);
+    const bbLast = bbSeries[bbSeries.length-1] || {};
+    // Get current price from RSI metadata or BBands middle
+    const bbMiddle = bbLast['Real Middle Band'] ?? null;
+    const bbUpper  = bbLast['Real Upper Band'] ?? null;
+    const bbLower  = bbLast['Real Lower Band'] ?? null;
+
+    const result = {
+      ticker: sym,
+      interval,
+      lastUpdated: new Date().toISOString(),
+      rsi: {
+        current: rsiLatest,
+        signal:  rsiSignal,
+        series:  rsiSeries.map(d=>({ date:d.date, value:d.RSI })),
+      },
+      macd: {
+        macd:      macdLast.MACD       ?? null,
+        signal:    macdLast.MACD_Signal ?? null,
+        histogram: macdLast.MACD_Hist   ?? null,
+        trend:     macdTrend,
+        cross:     macdCross,
+        series:    macdSeries.map(d=>({ date:d.date, macd:d.MACD, signal:d.MACD_Signal, hist:d.MACD_Hist })),
+      },
+      bbands: {
+        upper:     bbUpper,
+        middle:    bbMiddle,
+        lower:     bbLower,
+        bandwidth: (bbUpper != null && bbLower != null && bbMiddle) ? ((bbUpper-bbLower)/bbMiddle*100) : null,
+        series:    bbSeries.map(d=>({ date:d.date, upper:d['Real Upper Band'], middle:d['Real Middle Band'], lower:d['Real Lower Band'] })),
+      },
+    };
+
+    setCached(ck, result, 90*60*1000); // 90 min — preserva quota free plan
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT=process.env.PORT||3000;
