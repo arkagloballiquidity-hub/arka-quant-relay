@@ -1,13 +1,26 @@
 const express = require('express');
 const cors    = require('cors');
 const app     = express();
-app.use(cors({ origin: '*' }));
+
+// ─── CORS — solo dominios ARKA autorizados ────────────────────────────────────
+app.use(cors({
+  origin: [
+    /^https?:\/\/localhost(:\d+)?$/,
+    /^https:\/\/arka-quant(-[a-z0-9]+)?\.vercel\.app$/,
+    /^https:\/\/[a-z0-9-]+\.arkaltd\.io$/,
+    /^https:\/\/quant\.arkaltd\.io$/,
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // ─── API KEY AUTH ────────────────────────────────────────────────────────────
+// Sin bypass: si ARKA_API_KEY no está configurada, bloquear todo
 const requireAuth = (req, res, next) => {
   const key = process.env.ARKA_API_KEY;
-  if (!key) return next();
+  if (!key) return res.status(503).json({ error: 'Quant endpoints not configured' });
   const auth = req.headers['authorization'] || '';
   if (auth !== `Bearer ${key}`) return res.status(401).json({ error: 'Unauthorized' });
   next();
@@ -55,8 +68,7 @@ const _cache = new Map();
 function getCached(k){ const e=_cache.get(k); if(!e||Date.now()>e.exp){_cache.delete(k);return null;} return e.data; }
 function setCached(k,d,ttl=300_000){ _cache.set(k,{data:d,exp:Date.now()+ttl}); }
 
-app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'3.0',
-  endpoints:['/yahoo','/api/fractal','/api/anomaly','/api/forecast','/api/risk','/api/portfolio','/api/snapshot','/api/technicals']}));
+app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'4.0'}));
 
 // ─── LEGACY Yahoo proxy ───────────────────────────────────────────────────────
 app.get('/yahoo',async(req,res)=>{
@@ -360,43 +372,33 @@ app.get('/api/technicals', requireAuth, async (req, res) => {
 
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>{
-  console.log(`ARKA Quant Relay v2.0 en puerto ${PORT}`);
-  console.log(`API Key: ${process.env.ARKA_API_KEY?'ENABLED':'DISABLED (dev mode)'}`);
+  console.log(`ARKA Quant Relay v4.0 on :${PORT} | Auth:${process.env.ARKA_API_KEY?'ON':'UNCONFIGURED'}`);
 });
 
 // ─── /api/chat ────────────────────────────────────────────────────────────────
-// Proxies chat messages to Anthropic Claude (avoids CORS from browser)
-// Body: { system: string, messages: [{role, content}] }
 app.post('/api/chat', requireAuth, async (req, res) => {
   const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured in relay' });
+  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
 
-  const { system, messages } = req.body;
+  const { system, messages, max_tokens } = req.body || {};
   if (!messages?.length) return res.status(400).json({ error: 'messages required' });
+
+  // Clamp max_tokens, sanitizar mensajes (igual que main relay /ai)
+  const safeTokens = Math.min(Math.max(parseInt(max_tokens) || 1024, 50), 2000);
+  const safeMessages = messages.slice(0, 20).map(m => ({
+    role: ['user','assistant'].includes(m.role) ? m.role : 'user',
+    content: String(m.content || '').slice(0, 8000),
+  }));
+  const safeSystem = system ? String(system).slice(0, 2000) : 'Eres el asistente de trading de ARKA.';
 
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: system || 'Eres el asistente de trading de ARKA.',
-        messages
-      })
+      headers: { 'Content-Type':'application/json', 'x-api-key':ANTHROPIC_KEY, 'anthropic-version':'2023-06-01' },
+      body: JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:safeTokens, system:safeSystem, messages:safeMessages })
     });
-
-    if (!r.ok) {
-      const err = await r.json();
-      return res.status(r.status).json({ error: err.error?.message || `Anthropic HTTP ${r.status}` });
-    }
-
+    if (!r.ok) { const err=await r.json(); return res.status(r.status).json({ error:err.error?.message||`Anthropic HTTP ${r.status}` }); }
     const data = await r.json();
     res.json({ content: data.content?.[0]?.text || '' });
-
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
