@@ -6,9 +6,9 @@ const app     = express();
 app.use(cors({
   origin: [
     /^https?:\/\/localhost(:\d+)?$/,
-    /^https:\/\/arka-quant(-[a-z0-9]+)?\.vercel\.app$/,
+    /^https:\/\/arka-quant(-[a-z0-9-]+)?\.vercel\.app$/,        // cubre arka-quant-intelligence-nine etc
+    /^https:\/\/arka-quant-intelligence(-[a-z0-9]+)?\.vercel\.app$/,
     /^https:\/\/[a-z0-9-]+\.arkaltd\.io$/,
-    /^https:\/\/quant\.arkaltd\.io$/,
   ],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
