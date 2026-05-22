@@ -71,7 +71,7 @@ function setCached(k,d,ttl=300_000){ _cache.set(k,{data:d,exp:Date.now()+ttl}); 
 app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'4.0'}));
 
 // ─── LEGACY Yahoo proxy ───────────────────────────────────────────────────────
-app.get('/yahoo',async(req,res)=>{
+app.get('/yahoo',requireAuth,async(req,res)=>{
   const{ticker,range='1y',interval='1d'}=req.query;
   if(!ticker) return res.status(400).json({error:'ticker required'});
   try{
