@@ -62,18 +62,20 @@ async function fetchYahoo(ticker,range='1y',interval='1d') {
   return ts.map((t,i)=>({date:new Date(t*1000).toISOString(),close:cl[i]})).filter(d=>d.close!=null);
 }
 
+function validTicker(t){ return typeof t==='string'&&/^[A-Z0-9.\-=^]{1,20}$/i.test(t); }
+
 // ─── HEALTH ──────────────────────────────────────────────────────────────────
 // ─── IN-MEMORY CACHE ─────────────────────────────────────────────────────────
 const _cache = new Map();
 function getCached(k){ const e=_cache.get(k); if(!e||Date.now()>e.exp){_cache.delete(k);return null;} return e.data; }
 function setCached(k,d,ttl=300_000){ _cache.set(k,{data:d,exp:Date.now()+ttl}); }
 
-app.get('/health',(_, res)=>res.json({status:'ok',service:'arka-quant-relay',version:'4.0'}));
+app.get('/health',(_, res)=>res.json({status:'ok'}));
 
 // ─── LEGACY Yahoo proxy ───────────────────────────────────────────────────────
 app.get('/yahoo',requireAuth,async(req,res)=>{
   const{ticker,range='1y',interval='1d'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
     const url=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=${interval}&includePrePost=false&events=div%7Csplit`;
     const r=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json','Referer':'https://finance.yahoo.com/'}});
@@ -85,7 +87,7 @@ app.get('/yahoo',requireAuth,async(req,res)=>{
 // ─── /api/fractal ─────────────────────────────────────────────────────────────
 app.get('/api/fractal',requireAuth,async(req,res)=>{
   const{ticker,range='1y'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
     const interval=range==='1d'?'5m':range==='5d'?'1h':'1d';
     const data=await fetchYahoo(ticker,range,interval);
@@ -109,9 +111,9 @@ app.get('/api/fractal',requireAuth,async(req,res)=>{
 // ─── /api/anomaly ─────────────────────────────────────────────────────────────
 app.get('/api/anomaly',requireAuth,async(req,res)=>{
   const{ticker,interval='5m',period='5d',z_threshold='2'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
-    const winSize=parseInt(req.query.window)||20,zThr=parseFloat(z_threshold)||2;
+    const winSize=Math.min(Math.max(parseInt(req.query.window)||20,5),500),zThr=parseFloat(z_threshold)||2;
     const safeRange=period==='1d'?'5d':period;
     const data=await fetchYahoo(ticker,safeRange,interval);
     if(data.length<winSize+2) return res.status(422).json({error:'Insufficient data'});
@@ -143,7 +145,7 @@ app.get('/api/anomaly',requireAuth,async(req,res)=>{
 // ─── /api/forecast ────────────────────────────────────────────────────────────
 app.get('/api/forecast',requireAuth,async(req,res)=>{
   const{ticker,horizon='5',simulations='500'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
     const H=Math.min(parseInt(horizon)||5,30),SIM=Math.min(parseInt(simulations)||500,2000);
     const data=await fetchYahoo(ticker,'1y','1d');
@@ -176,7 +178,7 @@ app.get('/api/forecast',requireAuth,async(req,res)=>{
 // ─── /api/risk ────────────────────────────────────────────────────────────────
 app.get('/api/risk',requireAuth,async(req,res)=>{
   const{ticker,capital='10000',risk_pct='1',sl_pips='10',rr='2',conviction='alta',fractal_range='1d'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
     const cap=parseFloat(capital),pct=parseFloat(risk_pct),sl=parseFloat(sl_pips),rrV=parseFloat(rr);
     const convMult=conviction==='alta'?1:conviction==='media'?0.6:0.3;
@@ -221,7 +223,7 @@ app.get('/api/risk',requireAuth,async(req,res)=>{
 app.get('/api/portfolio',requireAuth,async(req,res)=>{
   const{tickers}=req.query;
   if(!tickers) return res.status(400).json({error:'tickers required (comma separated)'});
-  const list=tickers.split(',').map(t=>t.trim().toUpperCase()).filter(Boolean).slice(0,20);
+  const list=tickers.split(',').map(t=>t.trim().toUpperCase()).filter(t=>validTicker(t)).slice(0,20);
   const results=await Promise.allSettled(list.map(async ticker=>{
     const[d5,d20]=await Promise.all([fetchYahoo(ticker,'5d','1d'),fetchYahoo(ticker,'1mo','1d')]);
     if(!d5.length) throw new Error('No data');
@@ -243,7 +245,7 @@ app.get('/api/portfolio',requireAuth,async(req,res)=>{
 // ─── /api/snapshot ────────────────────────────────────────────────────────────
 app.get('/api/snapshot',requireAuth,async(req,res)=>{
   const{ticker,capital='10000',risk_pct='1',sl_pips='10',rr='2',conviction='alta'}=req.query;
-  if(!ticker) return res.status(400).json({error:'ticker required'});
+  if(!ticker||!validTicker(ticker)) return res.status(400).json({error:'ticker required'});
   try{
     const[frData,yaData]=await Promise.all([fetchYahoo(ticker,'1d','5m'),fetchYahoo(ticker,'5d','5m')]);
     const frC=frData.map(d=>d.close),frX=frC.map((_,i)=>i);
@@ -293,7 +295,7 @@ function avSeries(obj, keys, n=60) {
 
 app.get('/api/technicals', requireAuth, async (req, res) => {
   const { ticker, interval='daily' } = req.query;
-  if (!ticker) return res.status(400).json({ error:'ticker required' });
+  if (!ticker||!validTicker(ticker)) return res.status(400).json({ error:'ticker required' });
   const ck = `tech_${ticker.toUpperCase()}_${interval}`;
   const cached = getCached(ck);
   if (cached) return res.json(cached);
